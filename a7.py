@@ -11,14 +11,21 @@ import plotly.express as px
 import time
 
 # Snowflake/Cortex Configuration
-HOST = "GBJYVCT-LSB50763.snowflakecomputing.com"
+HOST = "gbjyvct-lsb50763.snowflakecomputing.com"
 DATABASE = "AI"
 SCHEMA = "DWH_MART"
-STAGE = "PROCUREMENT_SEARCH"
 API_ENDPOINT = "/api/v2/cortex/agent:run"
 API_TIMEOUT = 50000  # in milliseconds
-CORTEX_SEARCH_SERVICES = "AI.DWH_MART.ROC_SERVICE"
+CORTEX_SEARCH_SERVICES = "PROC_SERVICE"
 SEMANTIC_MODEL = '@"AI"."DWH_MART"."PROCUREMENT_SEARCH"/procurement.yaml'
+
+# Model options
+MODELS = [
+    "mistral-large",
+    "snowflake-arctic",
+    "llama3-70b",
+    "llama3-8b",
+]
 
 # Streamlit Page Config
 st.set_page_config(
@@ -69,7 +76,7 @@ if "clear_conversation" not in st.session_state:
 if "rerun_trigger" not in st.session_state:
     st.session_state.rerun_trigger = False
 
-# Hide Streamlit branding
+# Hide Streamlit branding, prevent chat history shading, and disable copy buttons/text boxes
 st.markdown("""
 <style>
 #MainMenu, header, footer {visibility: hidden;}
@@ -78,9 +85,15 @@ st.markdown("""
     background-color: transparent !important;
     white-space: pre-wrap !important;
     word-wrap: break-word !important;
+    overflow: hidden !important; /* Explicitly disable any overflow */
 }
 [data-testid="stChatMessageContent"] {
     white-space: pre-wrap !important;
+    word-wrap: break-word !important;
+    overflow: hidden !important; /* Ensure no scrollbars */
+    width: 100% !important; /* Ensure full width */
+    max-width: 100% !important; /* Prevent exceeding container width */
+    box-sizing: border-box !important; /* Include padding/margins in width */
 }
 .copy-button, [data-testid="copy-button"], [title="Copy to clipboard"], [data-testid="stTextArea"] {
     display: none !important;
@@ -88,22 +101,155 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Authentication logic
+def stream_text(text: str, chunk_size: int = 1, delay: float = 0.02):
+    for i in range(0, len(text), chunk_size):
+        yield text[i:i + chunk_size]
+        time.sleep(delay)
+
+def start_new_conversation():
+    st.session_state.chat_history = []
+    st.session_state.messages = []
+    st.session_state.current_query = None
+    st.session_state.current_results = None
+    st.session_state.current_sql = None
+    st.session_state.current_summary = None
+    st.session_state.chart_x_axis = None
+    st.session_state.chart_y_axis = None
+    st.session_state.chart_type = "Bar Chart"
+    st.session_state.last_suggestions = []
+    st.session_state.clear_conversation = False
+    st.session_state.rerun_trigger = True
+
+def init_service_metadata():
+    st.session_state.service_metadata = [{"name": "PROC_SERVICE", "search_column": ""}]
+    st.session_state.selected_cortex_search_service = "PROC_SERVICE"
+    try:
+        svc_search_col = session.sql("DESC CORTEX SEARCH SERVICE PROC_SERVICE;").collect()[0]["search_column"]
+        st.session_state.service_metadata = [{"name": "PROC_SERVICE", "search_column": svc_search_col}]
+    except Exception as e:
+        st.error(f"❌ Failed to verify PROC_SERVICE: {str(e)}. Using default configuration.")
+
+def init_config_options():
+    st.sidebar.button("Clear conversation", on_click=start_new_conversation)
+    st.sidebar.toggle("Use chat history", key="use_chat_history", value=True)
+    with st.sidebar.expander("Advanced options"):
+        st.selectbox("Select model:", MODELS, key="model_name")
+        st.number_input(
+            "Select number of context chunks",
+            value=100,
+            key="num_retrieved_chunks",
+            min_value=1,
+            max_value=400
+        )
+        st.number_input(
+            "Select number of messages to use in chat history",
+            value=10,
+            key="num_chat_messages",
+            min_value=1,
+            max_value=100
+        )
+
+def query_cortex_search_service(query):
+    try:
+        db, schema = session.get_current_database(), session.get_current_schema()
+        root = Root(session)
+        cortex_search_service = (
+            root.databases[db]
+            .schemas[schema]
+            .cortex_search_services["PROC_SERVICE"]
+        )
+        context_documents = cortex_search_service.search(
+            query, columns=[], limit=st.session_state.num_retrieved_chunks
+        )
+        results = context_documents.results
+        service_metadata = st.session_state.service_metadata
+        search_col = service_metadata[0]["search_column"]
+        context_str = ""
+        for i, r in enumerate(results):
+            context_str += f"Context document {i+1}: {r[search_col]} \n" + "\n"
+        return context_str
+    except Exception as e:
+        st.error(f"❌ Error querying Cortex Search service: {str(e)}")
+        return ""
+
+def get_chat_history():
+    start_index = max(
+        0, len(st.session_state.chat_history) - st.session_state.num_chat_messages
+    )
+    return st.session_state.chat_history[start_index : len(st.session_state.chat_history) - 1]
+
+def make_chat_history_summary(chat_history, question):
+    chat_history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+    prompt = f"""
+        [INST]
+        Based on the chat history below and the question, generate a query that extends the question
+        with the chat history provided. The query should be in natural language.
+        Answer with only the query. Do not add any explanation.
+
+        <chat_history>
+        {chat_history_str}
+        </chat_history>
+        <question>
+        {question}
+        </question>
+        [/INST]
+    """
+    summary = complete(st.session_state.model_name, prompt)
+    return summary
+
+def create_prompt(user_question):
+    chat_history_str = ""
+    if st.session_state.use_chat_history:
+        chat_history = get_chat_history()
+        if chat_history:
+            question_summary = make_chat_history_summary(chat_history, user_question)
+            prompt_context = query_cortex_search_service(question_summary)
+            chat_history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+        else:
+            prompt_context = query_cortex_search_service(user_question)
+    else:
+        prompt_context = query_cortex_search_service(user_question)
+        chat_history = []
+    
+    if not prompt_context.strip():
+        return complete(st.session_state.model_name, user_question)
+    
+    prompt = f"""
+        [INST]
+        You are a helpful AI chat assistant with RAG capabilities. When a user asks you a question,
+        you will also be given context provided between <context> and </context> tags. Use that context
+        with the user's chat history provided in the between <chat_history> and </chat_history> tags
+        to provide a summary that addresses the user's question. Ensure the answer is coherent, concise,
+        and directly relevant to the user's question.
+
+        If the user asks a generic question which cannot be answered with the given context or chat_history,
+        just respond directly and concisely to the user's question using the LLM.
+
+        <chat_history>
+        {chat_history_str}
+        </chat_history>
+        <context>
+        {prompt_context}
+        </context>
+        <question>
+        {user_question}
+        </question>
+        [/INST]
+        Answer:
+    """
+    return complete(st.session_state.model_name, prompt)
+
 if not st.session_state.authenticated:
     st.title("Welcome to Snowflake Cortex AI")
-    st.markdown("Please login to interact with your data")
-
+    st.write("Please login to interact with your data")
     st.session_state.username = st.text_input("Enter Snowflake Username:", value=st.session_state.username)
     st.session_state.password = st.text_input("Enter Password:", type="password")
-
     if st.button("Login"):
         try:
-            # Use the correct account identifier (remove the host part from account)
-            account_identifier = "GBJYVCT-LSB50763"
             conn = snowflake.connector.connect(
                 user=st.session_state.username,
                 password=st.session_state.password,
-                account=account_identifier,
+                account="gbjyvct-lsb50763",
                 host=HOST,
                 port=443,
                 warehouse="COMPUTE_WH",
@@ -112,179 +258,27 @@ if not st.session_state.authenticated:
                 schema=SCHEMA,
             )
             st.session_state.CONN = conn
-
-            # Create Snowpark session
             snowpark_session = Session.builder.configs({
                 "connection": conn
             }).create()
             st.session_state.snowpark_session = snowpark_session
-
-            # Set session parameters
             with conn.cursor() as cur:
                 cur.execute(f"USE DATABASE {DATABASE}")
                 cur.execute(f"USE SCHEMA {SCHEMA}")
                 cur.execute("ALTER SESSION SET TIMEZONE = 'UTC'")
                 cur.execute("ALTER SESSION SET QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE")
-
             st.session_state.authenticated = True
             st.success("Authentication successful! Redirecting...")
             st.rerun()
-
-        except snowflake.connector.errors.DatabaseError as db_err:
-            st.error(f"Authentication failed: Invalid username or password. Please try again.")
         except Exception as e:
-            st.error(f"Authentication failed: {str(e)}")
-
+            st.error(f"Authentication failed: {e}")
 else:
     session = st.session_state.snowpark_session
     root = Root(session)
 
-    # Rest of the code remains unchanged
-    def stream_text(text: str, chunk_size: int = 1, delay: float = 0.02):
-        for i in range(0, len(text), chunk_size):
-            yield text[i:i + chunk_size]
-            time.sleep(delay)
-
-    def start_new_conversation():
-        st.session_state.chat_history = []
-        st.session_state.messages = []
-        st.session_state.current_query = None
-        st.session_state.current_results = None
-        st.session_state.current_sql = None
-        st.session_state.current_summary = None
-        st.session_state.chart_x_axis = None
-        st.session_state.chart_y_axis = None
-        st.session_state.chart_type = "Bar Chart"
-        st.session_state.last_suggestions = []
-        st.session_state.clear_conversation = False
-        st.session_state.rerun_trigger = True
-
-    def init_service_metadata():
-        st.session_state.service_metadata = [{"name": "PROC_SERVICE", "search_column": ""}]
-        st.session_state.selected_cortex_search_service = "PROC_SERVICE"
-        try:
-            svc_search_col = session.sql("DESC CORTEX SEARCH SERVICE PROC_SERVICE;").collect()[0]["search_column"]
-            st.session_state.service_metadata = [{"name": "PROC_SERVICE", "search_column": svc_search_col}]
-        except Exception as e:
-            st.error(f"❌ Failed to verify PROC_SERVICE: {str(e)}. Using default configuration.")
-
-    def init_config_options():
-        st.sidebar.button("Clear conversation", on_click=start_new_conversation)
-        st.sidebar.toggle("Use chat history", key="use_chat_history", value=True)
-        with st.sidebar.expander("Advanced options"):
-            st.selectbox("Select model:", MODELS, key="model_name")
-            st.number_input(
-                "Select number of context chunks",
-                value=100,
-                key="num_retrieved_chunks",
-                min_value=1,
-                max_value=400
-            )
-            st.number_input(
-                "Select number of messages to use in chat history",
-                value=10,
-                key="num_chat_messages",
-                min_value=1,
-                max_value=100
-            )
-
-    def query_cortex_search_service(query):
-        try:
-            db, schema = session.get_current_database(), session.get_current_schema()
-            root = Root(session)
-            cortex_search_service = (
-                root.databases[db]
-                .schemas[schema]
-                .cortex_search_services["PROC_SERVICE"]
-            )
-            context_documents = cortex_search_service.search(
-                query, columns=[], limit=st.session_state.num_retrieved_chunks
-            )
-            results = context_documents.results
-            service_metadata = st.session_state.service_metadata
-            search_col = service_metadata[0]["search_column"]
-            context_str = ""
-            for i, r in enumerate(results):
-                context_str += f"Context document {i+1}: {r[search_col]} \n" + "\n"
-            return context_str
-        except Exception as e:
-            st.error(f"❌ Error querying Cortex Search service: {str(e)}")
-            return ""
-
-    def get_chat_history():
-        start_index = max(
-            0, len(st.session_state.chat_history) - st.session_state.num_chat_messages
-        )
-        return st.session_state.chat_history[start_index : len(st.session_state.chat_history) - 1]
-
-    def make_chat_history_summary(chat_history, question):
-        chat_history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
-        prompt = f"""
-            [INST]
-            Based on the chat history below and the question, generate a query that extends the question
-            with the chat history provided. The query should be in natural language.
-            Answer with only the query. Do not add any explanation.
-
-            <chat_history>
-            {chat_history_str}
-            </chat_history>
-            <question>
-            {question}
-            </question>
-            [/INST]
-        """
-        summary = complete(st.session_state.model_name, prompt)
-        return summary
-
-    def create_prompt(user_question):
-        chat_history_str = ""
-        if st.session_state.use_chat_history:
-            chat_history = get_chat_history()
-            if chat_history:
-                question_summary = make_chat_history_summary(chat_history, user_question)
-                prompt_context = query_cortex_search_service(question_summary)
-                chat_history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
-            else:
-                prompt_context = query_cortex_search_service(user_question)
-        else:
-            prompt_context = query_cortex_search_service(user_question)
-            chat_history = []
-        
-        if not prompt_context.strip():
-            return complete(st.session_state.model_name, user_question)
-        
-        prompt = f"""
-            [INST]
-            You are a helpful AI chat assistant with RAG capabilities. When a user asks you a question,
-            you will also be given context provided between <context> and </context> tags. Use that context
-            with the user's chat history provided in the between <chat_history> and </chat_history> tags
-            to provide a summary that addresses the user's question. Ensure the answer is coherent, concise,
-            and directly relevant to the user's question.
-
-            If the user asks a generic question which cannot be answered with the given context or chat_history,
-            just respond directly and concisely to the user's question using the LLM.
-
-            <chat_history>
-            {chat_history_str}
-            </chat_history>
-            <context>
-            {prompt_context}
-            </context>
-            <question>
-            {user_question}
-            </question>
-            [/INST]
-            Answer:
-        """
-        return complete(st.session_state.model_name, prompt)
-
-    # Model options
-    MODELS = [
-        "mistral-large",
-        "snowflake-arctic",
-        "llama3-70b",
-        "llama3-8b",
-    ]
+    if st.session_state.rerun_trigger:
+        st.session_state.rerun_trigger = False
+        st.rerun()
 
     def run_snowflake_query(query):
         try:
@@ -546,15 +540,7 @@ else:
     semantic_model_filename = SEMANTIC_MODEL.split("/")[-1]
     st.write(f"Semantic Model: {semantic_model_filename}")
     init_service_metadata()
-    # Display welcome message only once, outside of chat history loop
-    if not st.session_state.welcome_displayed:
-        welcome_message = "Hi, I am your PBCS Assistant. I can help you explore data, insights and analytics on PBCS (Planning and Budgeting insight solution)."
-        with st.chat_message("assistant"):
-            st.markdown(welcome_message, unsafe_allow_html=True)
-        # Add to chat_history only if not already present
-        if not any(msg["content"] == welcome_message for msg in st.session_state.chat_history):
-            st.session_state.chat_history.append({"role": "assistant", "content": welcome_message})
-        st.session_state.welcome_displayed = True
+
     st.sidebar.subheader("Sample Questions")
     sample_questions = [
         "What is DiLytics Procurement Insight Solution?",
@@ -568,28 +554,7 @@ else:
         "Which buyer has the least and highest PO approval duration?",
         "What are the top 5 suppliers based on purchase order amount?"
     ]
-    # Display chat history without chat bubbles for assistant, skipping the welcome message
-    for idx, message in enumerate(st.session_state.chat_history):
-        # Skip the welcome message since it's already displayed above
-        if idx == 0 and message["content"] == "Hi, I am your PBCS Assistant. I can help you explore data, insights and analytics on PBCS (Planning and Budgeting insight solution).":
-            continue
-        if message["role"] == "user":
-            with st.chat_message("user"):
-                st.markdown(f"**You:** {message['content']}", unsafe_allow_html=True)
-        else:
-            with st.chat_message("assistant"):
-                st.markdown(message["content"], unsafe_allow_html=True)
-            if "results" in message and message["results"] is not None:
-                with st.expander("View SQL Query", expanded=False):
-                    st.code(message["sql"], language="sql")
-                st.markdown(f"**Query Results ({len(message['results'])} rows):**")
-                st.dataframe(message["results"])
-                if not message["results"].empty and len(message["results"].columns) >= 2:
-                    st.markdown("**📈 Visualization:**")
-                    unique_prefix = f"chart_{idx}_{hash(message['content'])}"
-                    display_chart_tab(message["results"], prefix=unique_prefix, query=message.get("query", ""))
 
-    query = st.chat_input("Ask your question...")
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.write(message["content"])
