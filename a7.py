@@ -546,7 +546,15 @@ else:
     semantic_model_filename = SEMANTIC_MODEL.split("/")[-1]
     st.write(f"Semantic Model: {semantic_model_filename}")
     init_service_metadata()
-
+    # Display welcome message only once, outside of chat history loop
+    if not st.session_state.welcome_displayed:
+        welcome_message = "Hi, I am your PBCS Assistant. I can help you explore data, insights and analytics on PBCS (Planning and Budgeting insight solution)."
+        with st.chat_message("assistant"):
+            st.markdown(welcome_message, unsafe_allow_html=True)
+        # Add to chat_history only if not already present
+        if not any(msg["content"] == welcome_message for msg in st.session_state.chat_history):
+            st.session_state.chat_history.append({"role": "assistant", "content": welcome_message})
+        st.session_state.welcome_displayed = True
     st.sidebar.subheader("Sample Questions")
     sample_questions = [
         "What is DiLytics Procurement Insight Solution?",
@@ -560,7 +568,28 @@ else:
         "Which buyer has the least and highest PO approval duration?",
         "What are the top 5 suppliers based on purchase order amount?"
     ]
+    # Display chat history without chat bubbles for assistant, skipping the welcome message
+    for idx, message in enumerate(st.session_state.chat_history):
+        # Skip the welcome message since it's already displayed above
+        if idx == 0 and message["content"] == "Hi, I am your PBCS Assistant. I can help you explore data, insights and analytics on PBCS (Planning and Budgeting insight solution).":
+            continue
+        if message["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(f"**You:** {message['content']}", unsafe_allow_html=True)
+        else:
+            with st.chat_message("assistant"):
+                st.markdown(message["content"], unsafe_allow_html=True)
+            if "results" in message and message["results"] is not None:
+                with st.expander("View SQL Query", expanded=False):
+                    st.code(message["sql"], language="sql")
+                st.markdown(f"**Query Results ({len(message['results'])} rows):**")
+                st.dataframe(message["results"])
+                if not message["results"].empty and len(message["results"].columns) >= 2:
+                    st.markdown("**📈 Visualization:**")
+                    unique_prefix = f"chart_{idx}_{hash(message['content'])}"
+                    display_chart_tab(message["results"], prefix=unique_prefix, query=message.get("query", ""))
 
+    query = st.chat_input("Ask your question...")
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.write(message["content"])
