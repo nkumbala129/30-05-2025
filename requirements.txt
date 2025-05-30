@@ -5,7 +5,7 @@ rich<14.0.0  # Compatible with Streamlit
 # Snowflake connectivity
 snowflake-connector-python==3.10.0
 snowflake-core==0.11.0
-snowflake-snowpark-python>=1.30.0,<1.40.0  # Python 3.12+ compatible versions
+snowflake-snowpark-python==1.17.0
 
 # Data handling
 pandas==2.2.3
