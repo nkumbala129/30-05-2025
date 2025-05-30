@@ -1,18 +1,18 @@
-# Streamlit and dependencies
+# Streamlit and UI
 streamlit==1.38.0
-rich<14.0.0
+rich<14.0.0  # Compatible with Streamlit
 
 # Snowflake connectivity
 snowflake-connector-python==3.10.0
-snowflake-snowpark-python==1.17.0
 snowflake-core==0.11.0
+snowflake-snowpark-python>=1.30.0,<1.40.0  # Python 3.12+ compatible versions
 
-# Data handling & visualization
+# Data handling
 pandas==2.2.3
+pyarrow==16.1.0  # Required by Snowflake and Pandas
 plotly==5.24.1
-pyarrow==16.1.0
 
-# Networking & encryption
+# Networking & security
 requests==2.32.3
 retrying
 cryptography==42.0.8
