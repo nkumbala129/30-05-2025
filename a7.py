@@ -536,7 +536,7 @@ else:
                 "- [Contact Support](https://www.snowflake.com/en/support/)"
             )
 
-    st.title("Cortex AI Assistant by DiLytics")
+    st.title("Cortex AI-Procurement Assistant by DiLytics")
     semantic_model_filename = SEMANTIC_MODEL.split("/")[-1]
     st.write(f"Semantic Model: {semantic_model_filename}")
     init_service_metadata()
